@@ -1,0 +1,20 @@
+{
+  "expo": {
+    "name": "TaskBunny",
+    "slug": "taskbunny",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "taskbunny",
+    "platforms": ["ios", "android"],
+    "ios": {
+      "bundleIdentifier": "com.taskbunny.app",
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "com.taskbunny.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#4F46E5"
+      }
+    }
+  }
+}

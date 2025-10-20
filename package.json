@@ -1,0 +1,23 @@
+{
+  "name": "taskbunny",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "packages/shared",
+    "packages/server",
+    "packages/mobile"
+  ],
+  "scripts": {
+    "dev": "docker-compose up -d postgres && npm run dev --workspace=packages/server",
+    "build": "npm run build --workspace=packages/shared && npm run build --workspace=packages/server",
+    "test": "npm run test --workspaces --if-present",
+    "seed": "bash scripts/seed-events.sh",
+    "benchmark": "bash scripts/benchmark.sh",
+    "explain-queries": "bash scripts/explain-queries.sh",
+    "migrate": "docker-compose exec postgres psql -U taskbunny -d taskbunny -f /migrations/001_initial_schema.sql"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  }
+}
