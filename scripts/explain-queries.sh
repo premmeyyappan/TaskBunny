@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# explain-queries.sh — Capture EXPLAIN ANALYZE output for the three key dashboard
+# queries before and after 003_indexes.sql is applied.
+#
+# Extracts "Execution Time: X.XXX ms" from each plan and computes the actual
+# improvement ratio.  This is the source of the query-performance claim in the
+# project spec — the percentage is measured, not estimated.
+#
+# Usage (run in this order):
+#   1.  bash scripts/explain-queries.sh --before
+#   2.  Apply indexes:
+#       docker exec taskbunny-postgres-1 psql -U taskbunny -d taskbunny \
+#         < packages/server/src/db/migrations/003_indexes.sql
+#   3.  bash scripts/explain-queries.sh --after
+#
+# Results are appended to docs/benchmark-results.md.
+# Run --summary after both passes to print the improvement table.
+
+set -euo pipefail
+
+CONTAINER="${POSTGRES_CONTAINER:-taskbunny-postgres-1}"
+OUTPUT="docs/benchmark-results.md"
+MODE="${1:---before}"
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# ---------------------------------------------------------------------------
+# Helper: run EXPLAIN ANALYZE, print the plan, and echo the execution time (ms)
+# ---------------------------------------------------------------------------
+psql_explain_with_timing() {
+  local label="$1"
+  local sql="$2"
+  local plan
+
+  plan=$(docker exec "$CONTAINER" psql -U taskbunny -d taskbunny \
+    -c "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) ${sql}" 2>&1)
+
+  echo "### ${label} (${MODE}, ${TIMESTAMP})"
+  echo '```'
+  echo "$plan"
+  echo '```'
+  echo ""
+
+  # Extract "Execution Time: X.XXX ms" — last occurrence in the plan
+  echo "$plan" | grep -oP 'Execution Time:\s+\K[0-9]+\.[0-9]+' | tail -1
+}
+
+# ---------------------------------------------------------------------------
+# Helper: compute percentage reduction between two timing values
+# ---------------------------------------------------------------------------
+pct_reduction() {
+  local before="$1"
+  local after="$2"
+  # Use awk for floating-point arithmetic
+  awk -v b="$before" -v a="$after" 'BEGIN {
+    if (b == 0) { print "N/A"; exit }
+    printf "%.1f%%\n", (b - a) / b * 100
+  }'
+}
+
+# ---------------------------------------------------------------------------
+# Capture plans and timings
+# ---------------------------------------------------------------------------
+{
+  echo ""
+  echo "## Query Performance — ${MODE} indexes (${TIMESTAMP})"
+  echo ""
+} >> "$OUTPUT"
+
+Q1_TIME=$(psql_explain_with_timing \
+  "Q1: Recent events for user (7-day window)" \
+  "SELECT * FROM productivity_events
+   WHERE user_id = 'a0000000-0000-0000-0000-000000000001'
+     AND recorded_at > now() - INTERVAL '7 days'
+   ORDER BY recorded_at DESC LIMIT 50;" \
+  | tee -a "$OUTPUT" \
+  | tail -1)
+
+Q2_TIME=$(psql_explain_with_timing \
+  "Q2: Task list by status (covers idx_tasks_user_status)" \
+  "SELECT id, title, due_at, story_points, priority, completed_at
+   FROM tasks
+   WHERE user_id = 'a0000000-0000-0000-0000-000000000001'
+     AND status = 'in_progress'
+   ORDER BY priority ASC, due_at ASC NULLS LAST;" \
+  | tee -a "$OUTPUT" \
+  | tail -1)
+
+Q3_TIME=$(psql_explain_with_timing \
+  "Q3: Score history for trend chart (covers idx_scores_user_computed)" \
+  "SELECT score, completion_rate, computed_at
+   FROM productivity_scores
+   WHERE user_id = 'a0000000-0000-0000-0000-000000000001'
+   ORDER BY computed_at DESC LIMIT 30;" \
+  | tee -a "$OUTPUT" \
+  | tail -1)
+
+# Persist timings to a side-car file so --after can read --before values
+TIMING_FILE="/tmp/taskbunny_bench_timings.sh"
+
+if [[ "$MODE" == "--before" ]]; then
+  cat > "$TIMING_FILE" <<EOF
+BEFORE_Q1=${Q1_TIME}
+BEFORE_Q2=${Q2_TIME}
+BEFORE_Q3=${Q3_TIME}
+EOF
+  echo ""
+  echo "Before-index timings saved to ${TIMING_FILE}"
+  echo "Apply 003_indexes.sql then run: bash scripts/explain-queries.sh --after"
+
+elif [[ "$MODE" == "--after" ]]; then
+  if [[ ! -f "$TIMING_FILE" ]]; then
+    echo "ERROR: Run --before first to capture baseline timings."
+    exit 1
+  fi
+  # shellcheck source=/dev/null
+  source "$TIMING_FILE"
+
+  MEAN_BEFORE=$(awk -v q1="$BEFORE_Q1" -v q2="$BEFORE_Q2" -v q3="$BEFORE_Q3" \
+    'BEGIN { printf "%.3f", (q1 + q2 + q3) / 3 }')
+  MEAN_AFTER=$(awk -v q1="$Q1_TIME" -v q2="$Q2_TIME" -v q3="$Q3_TIME" \
+    'BEGIN { printf "%.3f", (q1 + q2 + q3) / 3 }')
+
+  Q1_REDUCTION=$(pct_reduction "$BEFORE_Q1" "$Q1_TIME")
+  Q2_REDUCTION=$(pct_reduction "$BEFORE_Q2" "$Q2_TIME")
+  Q3_REDUCTION=$(pct_reduction "$BEFORE_Q3" "$Q3_TIME")
+  MEAN_REDUCTION=$(pct_reduction "$MEAN_BEFORE" "$MEAN_AFTER")
+
+  SUMMARY=$(cat <<TABLEEOF
+
+## Measured Query Improvement (${TIMESTAMP})
+
+| Query | Before (ms) | After (ms) | Reduction |
+|---|---|---|---|
+| Q1: Recent events (7-day window) | ${BEFORE_Q1} | ${Q1_TIME} | ${Q1_REDUCTION} |
+| Q2: Task list by status | ${BEFORE_Q2} | ${Q2_TIME} | ${Q2_REDUCTION} |
+| Q3: Score history (trend chart) | ${BEFORE_Q3} | ${Q3_TIME} | ${Q3_REDUCTION} |
+| **Mean** | **${MEAN_BEFORE}** | **${MEAN_AFTER}** | **${MEAN_REDUCTION}** |
+
+Generated by \`scripts/explain-queries.sh\` from EXPLAIN ANALYZE output.
+TABLEEOF
+)
+
+  echo "$SUMMARY" >> "$OUTPUT"
+  echo ""
+  echo "$SUMMARY"
+  rm -f "$TIMING_FILE"
+fi
+
+echo "Query plans appended to ${OUTPUT}"
