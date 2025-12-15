@@ -1,0 +1,217 @@
+openapi: 3.0.3
+info:
+  title: TaskBunny API
+  version: 1.0.0
+  description: Distributed productivity analytics — REST + WebSocket API
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    EventPayload:
+      type: object
+      required: [clientEventId, deviceId, eventType, recordedAt, vectorClock]
+      properties:
+        clientEventId: { type: string, format: uuid }
+        deviceId:      { type: string }
+        taskId:        { type: string, format: uuid }
+        eventType:
+          type: string
+          enum: [task_started, task_paused, task_resumed, task_completed,
+                 task_cancelled, focus_session_tick, app_foregrounded,
+                 app_backgrounded, interruption, sync_initiated, sync_completed]
+        payload:       { type: object }
+        recordedAt:    { type: string, format: date-time }
+        vectorClock:   { type: object, additionalProperties: { type: integer } }
+
+    SyncBatchRequest:
+      type: object
+      required: [deviceId, clientVectorClock, events]
+      properties:
+        deviceId:          { type: string }
+        clientVectorClock: { type: object, additionalProperties: { type: integer } }
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/EventPayload' }
+          maxItems: 100
+
+    SyncBatchResult:
+      type: object
+      properties:
+        applied:           { type: integer }
+        skipped:           { type: integer }
+        conflicts:         { type: array, items: { type: object } }
+        serverVectorClock: { type: object, additionalProperties: { type: integer } }
+        serverTimestamp:   { type: string, format: date-time }
+
+    ProductivityScore:
+      type: object
+      properties:
+        score:             { type: number, minimum: 0, maximum: 100 }
+        completionRate:    { type: number, minimum: 0, maximum: 1 }
+        velocityIndex:     { type: number, minimum: 0, maximum: 1 }
+        focusDepth:        { type: number, minimum: 0, maximum: 1 }
+        consistencyScore:  { type: number, minimum: 0, maximum: 1 }
+        overdueRatio:      { type: number, minimum: 0, maximum: 1 }
+        windowStart:       { type: string, format: date-time }
+        windowEnd:         { type: string, format: date-time }
+        computedAt:        { type: string, format: date-time }
+
+paths:
+  /auth/register:
+    post:
+      summary: Register a new user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, name, password, deviceId]
+              properties:
+                email:    { type: string, format: email }
+                name:     { type: string }
+                password: { type: string, minLength: 8 }
+                deviceId: { type: string }
+      responses:
+        '201': { description: Created }
+        '409': { description: Email already registered }
+
+  /auth/login:
+    post:
+      summary: Login and receive a JWT
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, deviceId]
+              properties:
+                email:    { type: string }
+                password: { type: string }
+                deviceId: { type: string }
+      responses:
+        '200': { description: JWT token }
+        '401': { description: Invalid credentials }
+
+  /events:
+    post:
+      summary: Ingest a batch of productivity events (max 100)
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                events:
+                  type: array
+                  items: { $ref: '#/components/schemas/EventPayload' }
+                  maxItems: 100
+      responses:
+        '202': { description: Accepted for async processing }
+        '429': { description: Rate limit exceeded (5,000/device/day) }
+
+    get:
+      summary: Fetch recent events for offline reconciliation
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: since
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/EventPayload' }
+
+  /sync/batch:
+    post:
+      summary: Sync a batch of events with conflict resolution
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SyncBatchRequest' }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SyncBatchResult' }
+
+  /analytics/score:
+    get:
+      summary: Get the user's current productivity score
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: refresh
+          in: query
+          schema: { type: boolean }
+          description: Force recomputation instead of returning cached score
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductivityScore' }
+
+  /analytics/trend:
+    get:
+      summary: Time-series buckets for trend chart
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: days
+          in: query
+          schema: { type: integer, minimum: 7, maximum: 90, default: 30 }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    bucket:         { type: string, format: date }
+                    score:          { type: number }
+                    eventsCount:    { type: integer }
+                    tasksCompleted: { type: integer }
+
+  /tasks:
+    get:
+      summary: List tasks, optionally filtered by status
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [pending, in_progress, completed, cancelled] }
+      responses:
+        '200': { description: Task array }
+    post:
+      summary: Create a task
+      security: [{ bearerAuth: [] }]
+      responses:
+        '201': { description: Created task }
+
+  /tasks/{id}:
+    patch:
+      summary: Update a task (includes vector clock for conflict detection)
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Updated task }
+    delete:
+      summary: Delete a task
+      security: [{ bearerAuth: [] }]
+      responses:
+        '204': { description: Deleted }
